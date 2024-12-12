@@ -1,0 +1,1029 @@
+<?php
+// scanner_staged.php
+
+include 'db_connection.php';
+
+// Enable error reporting for debugging (Disable in production)
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+// Initialize variables for modal
+$modal_title = "";
+$modal_body = "";
+$show_modal = false;
+
+// Start session for potential CSRF protection or user authentication
+session_start();
+
+// Function to sanitize output
+function sanitize_output($data) {
+    return htmlspecialchars($data, ENT_QUOTES, 'UTF-8');
+}
+
+// Handle form submissions
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    // Handle Complete, Delete, and Edit actions separately
+    if (isset($_POST['complete'])) {
+        handleCompleteAction($conn, $_POST['staging_id'], $modal_title, $modal_body, $show_modal);
+    }
+
+    if (isset($_POST['delete'])) {
+        handleDeleteAction($conn, $_POST['staging_id'], $modal_title, $modal_body, $show_modal);
+    }
+
+    if (isset($_POST['edit'])) {
+        handleEditAction($conn, $_POST, $modal_title, $modal_body, $show_modal);
+    }
+}
+
+// Fetch all staging entries outside the POST block
+$staged_entries = fetchStagedEntries($conn);
+
+// Close the database connection
+$conn->close();
+
+/**
+ * Handles the Complete action.
+ */
+function handleCompleteAction($conn, $staging_id, &$modal_title, &$modal_body, &$show_modal) {
+    if ($staging_id > 0) {
+        try {
+            // Begin transaction
+            $conn->begin_transaction();
+
+            // Fetch staging entry
+            $stmt_staging = $conn->prepare("
+                SELECT finished_good_id, production_quantity, production_weight
+                FROM inventory_staging
+                WHERE id = ?
+                FOR UPDATE
+            ");
+            if (!$stmt_staging) {
+                throw new Exception('Error preparing staging statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_staging->bind_param('i', $staging_id);
+            if (!$stmt_staging->execute()) {
+                throw new Exception('Error executing staging statement: ' . sanitize_output($stmt_staging->error));
+            }
+            $stmt_staging->bind_result($finished_good_id, $production_quantity, $production_weight);
+            if (!$stmt_staging->fetch()) {
+                throw new Exception('Staging entry not found.');
+            }
+            $stmt_staging->close();
+
+            // Fetch BOM for finished_good_id
+            $stmt_bom = $conn->prepare("
+                SELECT br.raw_material_id, br.quantity, br.weight, rm.consumption_method
+                FROM bom_relations br
+                INNER JOIN raw_materials rm ON br.raw_material_id = rm.raw_material_id
+                WHERE br.finished_good_id = ?
+            ");
+            if (!$stmt_bom) {
+                throw new Exception('Error preparing BOM statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_bom->bind_param('i', $finished_good_id);
+            if (!$stmt_bom->execute()) {
+                throw new Exception('Error executing BOM statement: ' . sanitize_output($stmt_bom->error));
+            }
+            $result_bom = $stmt_bom->get_result();
+            $bom_relations = $result_bom->fetch_all(MYSQLI_ASSOC);
+            $stmt_bom->close();
+
+            if (empty($bom_relations)) {
+                throw new Exception('No BOM defined for the selected finished good.');
+            }
+
+            // For each raw material, decrease staged_quantity or staged_weight
+            foreach ($bom_relations as $relation) {
+                $raw_material_id = $relation['raw_material_id'];
+                $required_quantity = $relation['quantity'] * $production_quantity;
+                $required_weight = $relation['weight'] * $production_weight;
+                $consumption_method = $relation['consumption_method'];
+
+                if ($consumption_method === 'Quantity') {
+                    // Decrease staged_quantity
+                    $stmt_update = $conn->prepare("
+                        UPDATE inventory_raw_materials
+                        SET staged_quantity = staged_quantity - ?
+                        WHERE raw_material_id = ?
+                    ");
+                    if (!$stmt_update) {
+                        throw new Exception('Error preparing update statement: ' . sanitize_output($conn->error));
+                    }
+
+                    $stmt_update->bind_param('di', $required_quantity, $raw_material_id);
+                    if (!$stmt_update->execute()) {
+                        throw new Exception('Error updating inventory for raw material ID ' . $raw_material_id . ': ' . sanitize_output($stmt_update->error));
+                    }
+                    $stmt_update->close();
+                } elseif ($consumption_method === 'Weight') {
+                    // Decrease staged_weight
+                    $stmt_update = $conn->prepare("
+                        UPDATE inventory_raw_materials
+                        SET staged_weight = staged_weight - ?
+                        WHERE raw_material_id = ?
+                    ");
+                    if (!$stmt_update) {
+                        throw new Exception('Error preparing update statement: ' . sanitize_output($conn->error));
+                    }
+
+                    $stmt_update->bind_param('di', $required_weight, $raw_material_id);
+                    if (!$stmt_update->execute()) {
+                        throw new Exception('Error updating inventory for raw material ID ' . $raw_material_id . ': ' . sanitize_output($stmt_update->error));
+                    }
+                    $stmt_update->close();
+                }
+            }
+
+            // **Update** inventory_finished_goods instead of inserting
+            $stmt_update_fg = $conn->prepare("
+                UPDATE inventory_finished_goods
+                SET stock_quantity = stock_quantity + ?, stock_weight = stock_weight + ?, updated_date = NOW()
+                WHERE finished_good_id = ?
+            ");
+            if (!$stmt_update_fg) {
+                throw new Exception('Error preparing update inventory_finished_goods statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_update_fg->bind_param('ddi', $production_quantity, $production_weight, $finished_good_id);
+            if (!$stmt_update_fg->execute()) {
+                throw new Exception('Error updating inventory_finished_goods: ' . sanitize_output($stmt_update_fg->error));
+            }
+
+            // If no rows were updated, insert a new entry
+            if ($stmt_update_fg->affected_rows === 0) {
+                $stmt_insert_fg = $conn->prepare("
+                    INSERT INTO inventory_finished_goods (finished_good_id, stock_quantity, stock_weight, received_date, updated_date)
+                    VALUES (?, ?, ?, NOW(), NOW())
+                ");
+                if (!$stmt_insert_fg) {
+                    throw new Exception('Error preparing insert into inventory_finished_goods: ' . sanitize_output($conn->error));
+                }
+                $stmt_insert_fg->bind_param('idd', $finished_good_id, $production_quantity, $production_weight);
+                if (!$stmt_insert_fg->execute()) {
+                    throw new Exception('Error inserting into inventory_finished_goods: ' . sanitize_output($stmt_insert_fg->error));
+                }
+                $stmt_insert_fg->close();
+            }
+            $stmt_update_fg->close();
+
+            // Delete the staging entry
+            $stmt_delete = $conn->prepare("
+                DELETE FROM inventory_staging
+                WHERE id = ?
+            ");
+            if (!$stmt_delete) {
+                throw new Exception('Error preparing delete statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_delete->bind_param('i', $staging_id);
+            if (!$stmt_delete->execute()) {
+                throw new Exception('Error deleting staging entry: ' . sanitize_output($stmt_delete->error));
+            }
+            $stmt_delete->close();
+
+            // Commit transaction
+            $conn->commit();
+
+            // Set modal message
+            $modal_title = "Success";
+            $modal_body = "Finished good(s) completed successfully and moved to inventory_finished_goods.";
+            $show_modal = true;
+        } catch (Exception $e) {
+            $conn->rollback();
+            $modal_title = "Error";
+            $modal_body = "Error completing production: " . sanitize_output($e->getMessage());
+            $show_modal = true;
+        }
+    }
+}
+
+/**
+ * Handles the Delete action.
+ */
+function handleDeleteAction($conn, $staging_id, &$modal_title, &$modal_body, &$show_modal) {
+    if ($staging_id > 0) {
+        try {
+            // Begin transaction
+            $conn->begin_transaction();
+
+            // Fetch staging entry
+            $stmt_staging = $conn->prepare("
+                SELECT finished_good_id, production_quantity, production_weight
+                FROM inventory_staging
+                WHERE id = ?
+                FOR UPDATE
+            ");
+            if (!$stmt_staging) {
+                throw new Exception('Error preparing staging statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_staging->bind_param('i', $staging_id);
+            if (!$stmt_staging->execute()) {
+                throw new Exception('Error executing staging statement: ' . sanitize_output($stmt_staging->error));
+            }
+            $stmt_staging->bind_result($finished_good_id, $production_quantity, $production_weight);
+            if (!$stmt_staging->fetch()) {
+                throw new Exception('Staging entry not found.');
+            }
+            $stmt_staging->close();
+
+            // Fetch BOM for finished_good_id
+            $stmt_bom = $conn->prepare("
+                SELECT br.raw_material_id, br.quantity, br.weight, rm.consumption_method
+                FROM bom_relations br
+                INNER JOIN raw_materials rm ON br.raw_material_id = rm.raw_material_id
+                WHERE br.finished_good_id = ?
+            ");
+            if (!$stmt_bom) {
+                throw new Exception('Error preparing BOM statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_bom->bind_param('i', $finished_good_id);
+            if (!$stmt_bom->execute()) {
+                throw new Exception('Error executing BOM statement: ' . sanitize_output($stmt_bom->error));
+            }
+            $result_bom = $stmt_bom->get_result();
+            $bom_relations = $result_bom->fetch_all(MYSQLI_ASSOC);
+            $stmt_bom->close();
+
+            if (empty($bom_relations)) {
+                throw new Exception('No BOM defined for the selected finished good.');
+            }
+
+            // For each raw material, restore stock by adding back staged amounts and decrease staged quantities
+            foreach ($bom_relations as $relation) {
+                $raw_material_id = $relation['raw_material_id'];
+                $restored_quantity = $relation['quantity'] * $production_quantity;
+                $restored_weight = $relation['weight'] * $production_weight;
+                $consumption_method = $relation['consumption_method'];
+
+                if ($consumption_method === 'Quantity') {
+                    // Restore stock_quantity and decrease staged_quantity
+                    $stmt_update = $conn->prepare("
+                        UPDATE inventory_raw_materials
+                        SET stock_quantity = stock_quantity + ?, 
+                            staged_quantity = staged_quantity - ?
+                        WHERE raw_material_id = ?
+                    ");
+                    if (!$stmt_update) {
+                        throw new Exception('Error preparing update statement: ' . sanitize_output($conn->error));
+                    }
+
+                    $stmt_update->bind_param('ddi', $restored_quantity, $restored_quantity, $raw_material_id);
+                    if (!$stmt_update->execute()) {
+                        throw new Exception('Error updating inventory for raw material ID ' . $raw_material_id . ': ' . sanitize_output($stmt_update->error));
+                    }
+                    $stmt_update->close();
+                } elseif ($consumption_method === 'Weight') {
+                    // Restore stock_weight and decrease staged_weight
+                    $stmt_update = $conn->prepare("
+                        UPDATE inventory_raw_materials
+                        SET stock_weight = stock_weight + ?, 
+                            staged_weight = staged_weight - ?
+                        WHERE raw_material_id = ?
+                    ");
+                    if (!$stmt_update) {
+                        throw new Exception('Error preparing update statement: ' . sanitize_output($conn->error));
+                    }
+
+                    $stmt_update->bind_param('ddi', $restored_weight, $restored_weight, $raw_material_id);
+                    if (!$stmt_update->execute()) {
+                        throw new Exception('Error updating inventory for raw material ID ' . $raw_material_id . ': ' . sanitize_output($stmt_update->error));
+                    }
+                    $stmt_update->close();
+                }
+            }
+
+            // Delete the staging entry
+            $stmt_delete = $conn->prepare("
+                DELETE FROM inventory_staging
+                WHERE id = ?
+            ");
+            if (!$stmt_delete) {
+                throw new Exception('Error preparing delete statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_delete->bind_param('i', $staging_id);
+            if (!$stmt_delete->execute()) {
+                throw new Exception('Error deleting staging entry: ' . sanitize_output($stmt_delete->error));
+            }
+            $stmt_delete->close();
+
+            // Commit transaction
+            $conn->commit();
+
+            // Set modal message
+            $modal_title = "Deleted";
+            $modal_body = "Staged finished good has been deleted and raw materials have been restored to stock.";
+            $show_modal = true;
+        } catch (Exception $e) {
+            $conn->rollback();
+            $modal_title = "Error";
+            $modal_body = "Error deleting staging entry: " . sanitize_output($e->getMessage());
+            $show_modal = true;
+        }
+    }
+}
+
+/**
+ * Handles the Edit action.
+ */
+function handleEditAction($conn, $postData, &$modal_title, &$modal_body, &$show_modal) {
+    $staging_id = isset($postData['edit_staging_id']) ? (int)$postData['edit_staging_id'] : 0;
+    $new_production_quantity = isset($postData['new_production_quantity']) ? floatval($postData['new_production_quantity']) : 0;
+    $new_production_weight = isset($postData['new_production_weight']) ? floatval($postData['new_production_weight']) : 0;
+
+    if ($staging_id > 0) {
+        try {
+            // Begin transaction
+            $conn->begin_transaction();
+
+            // Fetch staging entry
+            $stmt_staging = $conn->prepare("
+                SELECT finished_good_id, production_quantity, production_weight
+                FROM inventory_staging
+                WHERE id = ?
+                FOR UPDATE
+            ");
+            if (!$stmt_staging) {
+                throw new Exception('Error preparing staging statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_staging->bind_param('i', $staging_id);
+            if (!$stmt_staging->execute()) {
+                throw new Exception('Error executing staging statement: ' . sanitize_output($stmt_staging->error));
+            }
+            $stmt_staging->bind_result($finished_good_id, $current_production_quantity, $current_production_weight);
+            if (!$stmt_staging->fetch()) {
+                throw new Exception('Staging entry not found.');
+            }
+            $stmt_staging->close();
+
+            // Fetch consumption_method
+            $stmt_method = $conn->prepare("
+                SELECT consumption_method
+                FROM finished_goods
+                WHERE finished_good_id = ?
+            ");
+            if (!$stmt_method) {
+                throw new Exception('Error preparing consumption_method statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_method->bind_param('i', $finished_good_id);
+            if (!$stmt_method->execute()) {
+                throw new Exception('Error executing consumption_method statement: ' . sanitize_output($stmt_method->error));
+            }
+            $stmt_method->bind_result($consumption_method);
+            if (!$stmt_method->fetch()) {
+                throw new Exception('Finished good not found.');
+            }
+            $stmt_method->close();
+
+            // Determine new production_amount based on consumption_method
+            if ($consumption_method === 'Quantity') {
+                $new_amount = $new_production_quantity;
+                $current_amount = $current_production_quantity;
+            } elseif ($consumption_method === 'Weight') {
+                $new_amount = $new_production_weight;
+                $current_amount = $current_production_weight;
+            } else {
+                throw new Exception('Invalid consumption method.');
+            }
+
+            // Calculate difference
+            $difference = $new_amount - $current_amount;
+
+            if ($difference == 0) {
+                // No change needed
+                $modal_title = "No Change";
+                $modal_body = "The production amount remains unchanged.";
+                $show_modal = true;
+                $conn->commit();
+                return;
+            }
+
+            // Fetch BOM for finished_good_id
+            $stmt_bom = $conn->prepare("
+                SELECT br.raw_material_id, br.quantity, br.weight, rm.consumption_method
+                FROM bom_relations br
+                INNER JOIN raw_materials rm ON br.raw_material_id = rm.raw_material_id
+                WHERE br.finished_good_id = ?
+            ");
+            if (!$stmt_bom) {
+                throw new Exception('Error preparing BOM statement: ' . sanitize_output($conn->error));
+            }
+            $stmt_bom->bind_param('i', $finished_good_id);
+            if (!$stmt_bom->execute()) {
+                throw new Exception('Error executing BOM statement: ' . sanitize_output($stmt_bom->error));
+            }
+            $result_bom = $stmt_bom->get_result();
+            $bom_relations = $result_bom->fetch_all(MYSQLI_ASSOC);
+            $stmt_bom->close();
+
+            if (empty($bom_relations)) {
+                throw new Exception('No BOM defined for the selected finished good.');
+            }
+
+            if ($difference > 0) {
+                // Need to increase production_amount
+                // Check if raw materials can cover the additional production
+                $insufficient = false;
+                $required_materials = [];
+                foreach ($bom_relations as $relation) {
+                    $raw_material_id = $relation['raw_material_id'];
+                    $required_quantity = $relation['quantity'] * $difference;
+                    $required_weight = $relation['weight'] * $difference;
+                    $consumption_method_rm = $relation['consumption_method'];
+
+                    if ($consumption_method_rm === 'Quantity') {
+                        $stmt_stock = $conn->prepare("
+                            SELECT stock_quantity
+                            FROM inventory_raw_materials
+                            WHERE raw_material_id = ?
+                        ");
+                        if (!$stmt_stock) {
+                            throw new Exception('Error preparing stock statement: ' . sanitize_output($conn->error));
+                        }
+                        $stmt_stock->bind_param('i', $raw_material_id);
+                        if (!$stmt_stock->execute()) {
+                            throw new Exception('Error executing stock statement: ' . sanitize_output($stmt_stock->error));
+                        }
+                        $stmt_stock->bind_result($stock_quantity);
+                        $stmt_stock->fetch();
+                        $stmt_stock->close();
+
+                        if ($stock_quantity < $required_quantity) {
+                            $insufficient = true;
+                        }
+
+                        $required_materials[$raw_material_id] = [
+                            'required_quantity' => $required_quantity,
+                            'required_weight' => 0.00,
+                            'consumption_method' => 'Quantity'
+                        ];
+                    } elseif ($consumption_method_rm === 'Weight') {
+                        $stmt_stock = $conn->prepare("
+                            SELECT stock_weight
+                            FROM inventory_raw_materials
+                            WHERE raw_material_id = ?
+                        ");
+                        if (!$stmt_stock) {
+                            throw new Exception('Error preparing stock statement: ' . sanitize_output($conn->error));
+                        }
+                        $stmt_stock->bind_param('i', $raw_material_id);
+                        if (!$stmt_stock->execute()) {
+                            throw new Exception('Error executing stock statement: ' . sanitize_output($stmt_stock->error));
+                        }
+                        $stmt_stock->bind_result($stock_weight);
+                        $stmt_stock->fetch();
+                        $stmt_stock->close();
+
+                        if ($stock_weight < $required_weight) {
+                            $insufficient = true;
+                        }
+
+                        $required_materials[$raw_material_id] = [
+                            'required_quantity' => 0.00,
+                            'required_weight' => $required_weight,
+                            'consumption_method' => 'Weight'
+                        ];
+                    }
+                }
+
+                if ($insufficient) {
+                    // Cannot cover the increase, show insufficient stock modal
+                    $insufficient_materials = [];
+                    foreach ($bom_relations as $relation) {
+                        $raw_material_id = $relation['raw_material_id'];
+                        $required_quantity = $relation['quantity'] * $difference;
+                        $required_weight = $relation['weight'] * $difference;
+                        $consumption_method_rm = $relation['consumption_method'];
+
+                        if ($consumption_method_rm === 'Quantity') {
+                            $stmt_stock = $conn->prepare("
+                                SELECT stock_quantity
+                                FROM inventory_raw_materials
+                                WHERE raw_material_id = ?
+                            ");
+                            if (!$stmt_stock) {
+                                throw new Exception('Error preparing stock statement: ' . sanitize_output($conn->error));
+                            }
+                            $stmt_stock->bind_param('i', $raw_material_id);
+                            if (!$stmt_stock->execute()) {
+                                throw new Exception('Error executing stock statement: ' . sanitize_output($stmt_stock->error));
+                            }
+                            $stmt_stock->bind_result($stock_quantity);
+                            $stmt_stock->fetch();
+                            $stmt_stock->close();
+
+                            $sufficient = $stock_quantity >= $required_quantity;
+
+                            // Fetch raw material details
+                            $stmt_rm = $conn->prepare("
+                                SELECT item_code, name
+                                FROM raw_materials
+                                WHERE raw_material_id = ?
+                            ");
+                            if (!$stmt_rm) {
+                                throw new Exception('Error preparing raw_materials statement: ' . sanitize_output($conn->error));
+                            }
+                            $stmt_rm->bind_param('i', $raw_material_id);
+                            if (!$stmt_rm->execute()) {
+                                throw new Exception('Error executing raw_materials statement: ' . sanitize_output($stmt_rm->error));
+                            }
+                            $stmt_rm->bind_result($item_code, $name);
+                            $stmt_rm->fetch();
+                            $stmt_rm->close();
+
+                            $insufficient_materials[] = [
+                                'item_code' => $item_code,
+                                'name' => $name,
+                                'required' => number_format($required_quantity, 2) . ' units',
+                                'available' => number_format($stock_quantity, 2) . ' units',
+                                'sufficient' => $sufficient
+                            ];
+                        } elseif ($consumption_method_rm === 'Weight') {
+                            $stmt_stock = $conn->prepare("
+                                SELECT stock_weight
+                                FROM inventory_raw_materials
+                                WHERE raw_material_id = ?
+                            ");
+                            if (!$stmt_stock) {
+                                throw new Exception('Error preparing stock statement: ' . sanitize_output($conn->error));
+                            }
+                            $stmt_stock->bind_param('i', $raw_material_id);
+                            if (!$stmt_stock->execute()) {
+                                throw new Exception('Error executing stock statement: ' . sanitize_output($stmt_stock->error));
+                            }
+                            $stmt_stock->bind_result($stock_weight);
+                            $stmt_stock->fetch();
+                            $stmt_stock->close();
+
+                            $sufficient = $stock_weight >= $required_weight;
+
+                            // Fetch raw material details
+                            $stmt_rm = $conn->prepare("
+                                SELECT item_code, name
+                                FROM raw_materials
+                                WHERE raw_material_id = ?
+                            ");
+                            if (!$stmt_rm) {
+                                throw new Exception('Error preparing raw_materials statement: ' . sanitize_output($conn->error));
+                            }
+                            $stmt_rm->bind_param('i', $raw_material_id);
+                            if (!$stmt_rm->execute()) {
+                                throw new Exception('Error executing raw_materials statement: ' . sanitize_output($stmt_rm->error));
+                            }
+                            $stmt_rm->bind_result($item_code, $name);
+                            $stmt_rm->fetch();
+                            $stmt_rm->close();
+
+                            $insufficient_materials[] = [
+                                'item_code' => $item_code,
+                                'name' => $name,
+                                'required' => number_format($required_weight, 2) . ' kg',
+                                'available' => number_format($stock_weight, 2) . ' kg',
+                                'sufficient' => $sufficient
+                            ];
+                        }
+                    }
+
+                    // Set insufficient stock modal
+                    $modal_title = "Insufficient Stock";
+                    $modal_body = "Cannot increase production to the desired amount due to insufficient stock for the following raw materials:<br><br>";
+
+                    // Build the table in modal body
+                    $modal_body .= '<table class="table table-bordered">';
+                    $modal_body .= '<thead><tr><th>Item Code</th><th>Name</th><th>Required Quantity/Weight</th><th>Available Quantity/Weight</th></tr></thead>';
+                    $modal_body .= '<tbody>';
+                    foreach ($insufficient_materials as $material) {
+                        $row_class = $material['sufficient'] ? 'table-success' : 'table-danger';
+                        $modal_body .= '<tr class="' . $row_class . '">';
+                        $modal_body .= '<td>' . sanitize_output($material['item_code']) . '</td>';
+                        $modal_body .= '<td>' . sanitize_output($material['name']) . '</td>';
+                        $modal_body .= '<td>' . $material['required'] . '</td>';
+                        $modal_body .= '<td>' . $material['available'] . '</td>';
+                        $modal_body .= '</tr>';
+                    }
+                    $modal_body .= '</tbody></table>';
+
+                    // Add option to adjust to max producible
+                    if ($difference > 0) {
+                        // Calculate max producible
+                        $max_producible = null;
+                        foreach ($required_materials as $raw_material_id => $req_material) {
+                            if ($req_material['consumption_method'] === 'Quantity') {
+                                $stmt_stock = $conn->prepare("
+                                    SELECT stock_quantity
+                                    FROM inventory_raw_materials
+                                    WHERE raw_material_id = ?
+                                ");
+                                if (!$stmt_stock) {
+                                    throw new Exception('Error preparing stock statement: ' . sanitize_output($conn->error));
+                                }
+                                $stmt_stock->bind_param('i', $raw_material_id);
+                                if (!$stmt_stock->execute()) {
+                                    throw new Exception('Error executing stock statement: ' . sanitize_output($stmt_stock->error));
+                                }
+                                $stmt_stock->bind_result($stock_quantity);
+                                $stmt_stock->fetch();
+                                $stmt_stock->close();
+
+                                if ($req_material['required_quantity'] > 0) {
+                                    $possible = floor($stock_quantity / $req_material['required_quantity']);
+                                    if ($max_producible === null || $possible < $max_producible) {
+                                        $max_producible = $possible;
+                                    }
+                                }
+                            } elseif ($req_material['consumption_method'] === 'Weight') {
+                                $stmt_stock = $conn->prepare("
+                                    SELECT stock_weight
+                                    FROM inventory_raw_materials
+                                    WHERE raw_material_id = ?
+                                ");
+                                if (!$stmt_stock) {
+                                    throw new Exception('Error preparing stock statement: ' . sanitize_output($conn->error));
+                                }
+                                $stmt_stock->bind_param('i', $raw_material_id);
+                                if (!$stmt_stock->execute()) {
+                                    throw new Exception('Error executing stock statement: ' . sanitize_output($stmt_stock->error));
+                                }
+                                $stmt_stock->bind_result($stock_weight);
+                                $stmt_stock->fetch();
+                                $stmt_stock->close();
+
+                                if ($req_material['required_weight'] > 0) {
+                                    $possible = floor($stock_weight / $req_material['required_weight']);
+                                    if ($max_producible === null || $possible < $max_producible) {
+                                        $max_producible = $possible;
+                                    }
+                                }
+                            }
+                        }
+
+                        if ($max_producible > 0) {
+                            $modal_body .= '<p><strong>You can produce a maximum of ' . sanitize_output($max_producible) . ' ' . ($consumption_method === 'Quantity' ? 'units' : 'kg') . ' based on current stock.</strong></p>';
+                            $modal_body .= '<form method="POST">';
+                            $modal_body .= '<input type="hidden" name="edit" value="1">';
+                            $modal_body .= '<input type="hidden" name="edit_staging_id" value="' . sanitize_output($staging_id) . '">';
+                            if ($consumption_method === 'Quantity') {
+                                $modal_body .= '<input type="hidden" name="new_production_quantity" value="' . sanitize_output($max_producible) . '">';
+                            } elseif ($consumption_method === 'Weight') {
+                                $modal_body .= '<input type="hidden" name="new_production_weight" value="' . sanitize_output($max_producible) . '">';
+                            }
+                            $modal_body .= '<button type="submit" class="btn btn-primary">Produce ' . sanitize_output($max_producible) . ' ' . ($consumption_method === 'Quantity' ? 'units' : 'kg') . '</button>';
+                            $modal_body .= '</form>';
+                        }
+                    }
+
+                    $show_modal = true;
+                }
+            } elseif ($difference < 0) {
+                // Decrease production_amount
+                $difference = abs($difference);
+
+                // For decreasing, restore stock by adding back staged amounts and decrease staged quantities
+                foreach ($bom_relations as $relation) {
+                    $raw_material_id = $relation['raw_material_id'];
+                    $restored_quantity = $relation['quantity'] * $difference;
+                    $restored_weight = $relation['weight'] * $difference;
+                    $consumption_method_rm = $relation['consumption_method'];
+
+                    if ($consumption_method_rm === 'Quantity') {
+                        // Restore stock_quantity and decrease staged_quantity
+                        $stmt_update = $conn->prepare("
+                            UPDATE inventory_raw_materials
+                            SET stock_quantity = stock_quantity + ?, 
+                                staged_quantity = staged_quantity - ?
+                            WHERE raw_material_id = ?
+                        ");
+                        if (!$stmt_update) {
+                            throw new Exception('Error preparing update statement: ' . sanitize_output($conn->error));
+                        }
+
+                        $stmt_update->bind_param('ddi', $restored_quantity, $restored_quantity, $raw_material_id);
+                        if (!$stmt_update->execute()) {
+                            throw new Exception('Error updating inventory for raw material ID ' . $raw_material_id . ': ' . sanitize_output($stmt_update->error));
+                        }
+                        $stmt_update->close();
+                    } elseif ($consumption_method_rm === 'Weight') {
+                        // Restore stock_weight and decrease staged_weight
+                        $stmt_update = $conn->prepare("
+                            UPDATE inventory_raw_materials
+                            SET stock_weight = stock_weight + ?, 
+                                staged_weight = staged_weight - ?
+                            WHERE raw_material_id = ?
+                        ");
+                        if (!$stmt_update) {
+                            throw new Exception('Error preparing update statement: ' . sanitize_output($conn->error));
+                        }
+
+                        $stmt_update->bind_param('ddi', $restored_weight, $restored_weight, $raw_material_id);
+                        if (!$stmt_update->execute()) {
+                            throw new Exception('Error updating inventory for raw material ID ' . $raw_material_id . ': ' . sanitize_output($stmt_update->error));
+                        }
+                        $stmt_update->close();
+                    }
+                }
+
+                // Update the staging entry with the new production amount
+                if ($consumption_method === 'Quantity') {
+                    $stmt_update_staging = $conn->prepare("
+                        UPDATE inventory_staging
+                        SET production_quantity = production_quantity - ?
+                        WHERE id = ?
+                    ");
+                    if (!$stmt_update_staging) {
+                        throw new Exception('Error preparing update staging statement: ' . sanitize_output($conn->error));
+                    }
+                    $stmt_update_staging->bind_param('di', $difference, $staging_id);
+                    if (!$stmt_update_staging->execute()) {
+                        throw new Exception('Error updating staging entry: ' . sanitize_output($stmt_update_staging->error));
+                    }
+                    $stmt_update_staging->close();
+                } elseif ($consumption_method === 'Weight') {
+                    $stmt_update_staging = $conn->prepare("
+                        UPDATE inventory_staging
+                        SET production_weight = production_weight - ?
+                        WHERE id = ?
+                    ");
+                    if (!$stmt_update_staging) {
+                        throw new Exception('Error preparing update staging statement: ' . sanitize_output($conn->error));
+                    }
+                    $stmt_update_staging->bind_param('di', $difference, $staging_id);
+                    if (!$stmt_update_staging->execute()) {
+                        throw new Exception('Error updating staging entry: ' . sanitize_output($stmt_update_staging->error));
+                    }
+                    $stmt_update_staging->close();
+                }
+
+                // Commit transaction
+                $conn->commit();
+
+                // Set modal message
+                $modal_title = "Updated";
+                $modal_body = "Staged production has been updated successfully.";
+                $show_modal = true;
+            }
+
+            // Commit transaction if no issues
+            if ($difference !== 0) {
+                $conn->commit();
+            }
+        } catch (Exception $e) {
+            $conn->rollback();
+            $modal_title = "Error";
+            $modal_body = "Error editing staging entry: " . sanitize_output($e->getMessage());
+            $show_modal = true;
+        }
+    }
+}
+
+/**
+ * Fetches all staged finished goods.
+ */
+function fetchStagedEntries($conn) {
+    $staged_entries = [];
+    try {
+        $stmt = $conn->prepare("
+            SELECT isg.id, fg.item_code, fg.name, isg.production_quantity, isg.production_weight, fg.consumption_method
+            FROM inventory_staging isg
+            INNER JOIN finished_goods fg ON isg.finished_good_id = fg.finished_good_id
+            ORDER BY isg.created_at DESC
+        ");
+        if (!$stmt) {
+            throw new Exception('Error preparing staging fetch statement: ' . sanitize_output($conn->error));
+        }
+        if (!$stmt->execute()) {
+            throw new Exception('Error executing staging fetch statement: ' . sanitize_output($stmt->error));
+        }
+
+        // Bind the result variables
+        $stmt->bind_result($id, $item_code, $name, $production_quantity, $production_weight, $consumption_method);
+
+        // Fetch values and populate $staged_entries
+        while ($stmt->fetch()) {
+            $staged_entries[] = [
+                'id' => $id,
+                'item_code' => $item_code,
+                'name' => $name,
+                'production_quantity' => $production_quantity,
+                'production_weight' => $production_weight,
+                'consumption_method' => $consumption_method
+            ];
+        }
+
+        $stmt->close();
+    } catch (Exception $e) {
+        // Handle fetch error
+        global $modal_title, $modal_body, $show_modal;
+        $modal_title = "Error";
+        $modal_body = "Error fetching staged entries: " . sanitize_output($e->getMessage());
+        $show_modal = true;
+    }
+
+    return $staged_entries;
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Staged Finished Goods</title>
+    <!-- Meta tag for responsive design -->
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        /* Custom styles */
+        body {
+            background-color: #f8f9fa;
+        }
+        .container {
+            max-width: 1000px;
+        }
+        /* Adjustments for smaller screens */
+        @media (max-width: 576px) {
+            h1 {
+                font-size: 1.5rem;
+            }
+            th, td {
+                font-size: 0.9rem;
+            }
+            .btn {
+                font-size: 0.8rem;
+                padding: 0.3rem 0.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="container mt-5">
+    <h1 class="mb-4">Staged Finished Goods</h1>
+    <table class="table table-striped table-bordered">
+        <thead class="table-dark">
+            <tr>
+                <th>Item Code</th>
+                <th>Name</th>
+                <th>Production Quantity</th>
+                <th>Production Weight</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            <?php if (!empty($staged_entries)): ?>
+                <?php foreach ($staged_entries as $entry): ?>
+                    <tr>
+                        <td><?= sanitize_output($entry['item_code']) ?></td>
+                        <td><?= sanitize_output($entry['name']) ?></td>
+                        <td><?= sanitize_output($entry['production_quantity']) ?></td>
+                        <td><?= sanitize_output($entry['production_weight']) ?></td>
+                        <td>
+                            <!-- Complete Button -->
+                            <form method="POST" class="d-inline">
+                                <input type="hidden" name="staging_id" value="<?= sanitize_output($entry['id']) ?>">
+                                <button type="submit" name="complete" class="btn btn-success btn-sm" onclick="return confirm('Are you sure you want to complete this production?')">Complete</button>
+                            </form>
+                            
+                            <!-- Edit Button -->
+                            <button type="button" class="btn btn-primary btn-sm edit-button" 
+                                    data-id="<?= sanitize_output($entry['id']) ?>" 
+                                    data-item-code="<?= sanitize_output($entry['item_code']) ?>" 
+                                    data-name="<?= sanitize_output($entry['name']) ?>" 
+                                    data-production-quantity="<?= sanitize_output($entry['production_quantity']) ?>" 
+                                    data-production-weight="<?= sanitize_output($entry['production_weight']) ?>" 
+                                    data-consumption-method="<?= sanitize_output($entry['consumption_method']) ?>">
+                                Edit
+                            </button>
+                            
+                            <!-- Delete Button -->
+                            <form method="POST" class="d-inline">
+                                <input type="hidden" name="staging_id" value="<?= sanitize_output($entry['id']) ?>">
+                                <button type="submit" name="delete" class="btn btn-danger btn-sm" onclick="return confirm('Are you sure you want to delete this staging entry?')">Delete</button>
+                            </form>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <tr>
+                    <td colspan="5" class="text-center">No staged finished goods found.</td>
+                </tr>
+            <?php endif; ?>
+        </tbody>
+    </table>
+</div>
+
+<!-- Edit Modal -->
+<div class="modal fade" id="editModal" tabindex="-1" aria-labelledby="editModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" id="editForm">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="editModalLabel">Edit Staged Production</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" name="edit" value="1">
+                    <input type="hidden" name="edit_staging_id" id="edit_staging_id" value="">
+                    
+                    <div class="mb-3">
+                        <label for="edit_item_code" class="form-label">Item Code</label>
+                        <input type="text" class="form-control" id="edit_item_code" disabled>
+                    </div>
+                    <div class="mb-3">
+                        <label for="edit_name" class="form-label">Name</label>
+                        <input type="text" class="form-control" id="edit_name" disabled>
+                    </div>
+                    <div class="mb-3" id="edit_quantity_field" style="display: none;">
+                        <label for="new_production_quantity" class="form-label">New Production Quantity</label>
+                        <input type="number" step="1" min="1" class="form-control" id="new_production_quantity" name="new_production_quantity" aria-label="Enter New Production Quantity">
+                    </div>
+                    <div class="mb-3" id="edit_weight_field" style="display: none;">
+                        <label for="new_production_weight" class="form-label">New Production Weight</label>
+                        <input type="number" step="0.01" min="0.01" class="form-control" id="new_production_weight" name="new_production_weight" aria-label="Enter New Production Weight">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Generic Modal for Messages -->
+<div class="modal fade" id="genericModal" tabindex="-1" aria-labelledby="genericModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><?= sanitize_output($modal_title) ?></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <?= $modal_body ?>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <!-- Additional buttons can be added dynamically if needed -->
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Modal JavaScript -->
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Get all edit buttons
+        const editButtons = document.querySelectorAll('.edit-button');
+        const editModal = new bootstrap.Modal(document.getElementById('editModal'));
+        const editForm = document.getElementById('editForm');
+        const edit_staging_id = document.getElementById('edit_staging_id');
+        const edit_item_code = document.getElementById('edit_item_code');
+        const edit_name = document.getElementById('edit_name');
+        const edit_quantity_field = document.getElementById('edit_quantity_field');
+        const edit_weight_field = document.getElementById('edit_weight_field');
+
+        editButtons.forEach(button => {
+            button.addEventListener('click', function() {
+                const stagingId = this.getAttribute('data-id');
+                const itemCode = this.getAttribute('data-item-code');
+                const name = this.getAttribute('data-name');
+                const productionQuantity = this.getAttribute('data-production-quantity');
+                const productionWeight = this.getAttribute('data-production-weight');
+                const consumptionMethod = this.getAttribute('data-consumption-method');
+
+                // Set modal fields
+                edit_staging_id.value = stagingId;
+                edit_item_code.value = itemCode;
+                edit_name.value = name;
+
+                if (consumptionMethod === 'Quantity') {
+                    edit_quantity_field.style.display = 'block';
+                    edit_weight_field.style.display = 'none';
+                    document.getElementById('new_production_quantity').value = productionQuantity;
+                    document.getElementById('new_production_weight').value = '';
+                } else if (consumptionMethod === 'Weight') {
+                    edit_quantity_field.style.display = 'none';
+                    edit_weight_field.style.display = 'block';
+                    document.getElementById('new_production_weight').value = productionWeight;
+                    document.getElementById('new_production_quantity').value = '';
+                } else {
+                    edit_quantity_field.style.display = 'none';
+                    edit_weight_field.style.display = 'none';
+                }
+
+                // Show modal
+                editModal.show();
+            });
+        });
+
+        // Trigger generic modal if show_modal is true
+        <?php if ($show_modal): ?>
+            window.addEventListener('load', function () {
+                var genericModal = new bootstrap.Modal(document.getElementById('genericModal'));
+                genericModal.show();
+            });
+        <?php endif; ?>
+    });
+</script>
+
+<!-- Bootstrap JS and Dependencies -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
